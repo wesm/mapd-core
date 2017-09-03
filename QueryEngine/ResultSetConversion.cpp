@@ -26,19 +26,15 @@
 #include <errno.h>
 #include <string>
 
-#include "arrow/array.h"
-#include "arrow/builder.h"
-#include "arrow/buffer.h"
+#include "arrow/api.h"
 #include "arrow/io/memory.h"
-#include "arrow/ipc/metadata.h"
-#include "arrow/ipc/reader.h"
-#include "arrow/ipc/writer.h"
-#include "arrow/pretty_print.h"
-#include "arrow/memory_pool.h"
-#include "arrow/type.h"
+#include "arrow/ipc/api.h"
 
 #ifdef HAVE_CUDA
 #include <cuda.h>
+
+#include "arrow/gpu/cuda_api.h"
+
 #endif  // HAVE_CUDA
 #include <future>
 
@@ -411,21 +407,11 @@ void append_value_array(ValueArray& dst, const ValueArray& src, const Field& fie
   }
 }
 
-std::shared_ptr<PoolBuffer> serialize_arrow_schema(const std::shared_ptr<Schema>& schema, ipc::DictionaryMemo& memo) {
-  auto buffer = std::make_shared<PoolBuffer>(default_memory_pool());
-  io::BufferOutputStream sink(buffer);
-  std::shared_ptr<ipc::RecordBatchStreamWriter> writer;
-  RETURN_IF_NOT_OK(ipc::RecordBatchStreamWriter::Open(&sink, schema, &writer));
-  writer->Close();
-  return buffer;
-}
-
 void print_serialized_schema(const uint8_t* data, const size_t length) {
-  const auto payload = std::make_shared<arrow::Buffer>(data, length);
-  auto buffer = std::make_shared<io::BufferReader>(payload);
-  std::shared_ptr<ipc::RecordBatchStreamReader> reader;
-  ipc::RecordBatchStreamReader::Open(buffer, &reader);
-  auto schema = reader->schema();
+  io::BufferReader reader(std::make_shared<arrow::Buffer>(data, length));
+  std::shared_ptr<Schema> schema;
+  ipc::ReadSchema(&reader, &schema);
+
   std::cout << "Schema: " << schema->ToString() << std::endl;
   for (int i = 0; i < schema->num_fields(); ++i) {
     std::shared_ptr<DictionaryType> dict_type = std::dynamic_pointer_cast<DictionaryType>(schema->field(i)->type());
@@ -435,35 +421,6 @@ void print_serialized_schema(const uint8_t* data, const size_t length) {
     PrettyPrint(*dict_type->dictionary(), 0, &std::cout);
     std::cout << std::endl;
   }
-
-  std::shared_ptr<RecordBatch> batch;
-  reader->GetNextRecordBatch(&batch);
-  CHECK(!batch);
-}
-
-std::shared_ptr<PoolBuffer> serialize_arrow_records(const RecordBatch& rb) {
-  int64_t rb_sz = 0;
-  if (!rb.num_rows()) {
-    return std::make_shared<PoolBuffer>();
-  }
-  ASSERT_OK(ipc::GetRecordBatchSize(rb, &rb_sz));
-  auto pool = default_memory_pool();
-  auto buffer = std::make_shared<PoolBuffer>(pool);
-  buffer->Reserve(rb_sz);
-  io::BufferOutputStream sink(buffer);
-  // Frame of reference in file format is 0, see ARROW-384
-  const int64_t buffer_start_offset = 0;
-  const bool is_large_record = false;
-  ipc::FileBlock dummy_block{0, 0, 0};
-  RETURN_IF_NOT_OK(ipc::WriteRecordBatch(rb,
-                                         buffer_start_offset,
-                                         &sink,
-                                         &dummy_block.metadata_length,
-                                         &dummy_block.body_length,
-                                         pool,
-                                         kMaxNestingDepth,
-                                         is_large_record));
-  return buffer;
 }
 
 void print_serialized_records(const uint8_t* data, const size_t length, const std::shared_ptr<Schema>& schema) {
@@ -472,20 +429,13 @@ void print_serialized_records(const uint8_t* data, const size_t length, const st
     return;
   }
 
-  const auto payload = std::make_shared<arrow::Buffer>(data, length);
-  auto buffer_reader = std::make_shared<io::BufferReader>(payload);
+  io::BufferReader buffer_reader(std::make_shared<arrow::Buffer>(data, length));
 
-  std::shared_ptr<ipc::Message> message;
-  ReadMessage(buffer_reader.get(), &message);
-
-  // The buffer offsets start at 0, so we must construct a
-  // RandomAccessFile according to that frame of reference
-  std::shared_ptr<Buffer> body_payload;
-  buffer_reader->Read(message->body_length(), &body_payload);
-  io::BufferReader body_reader(body_payload);
+  std::unique_ptr<ipc::Message> message;
+  ReadMessage(&buffer_reader, &message);
 
   std::shared_ptr<RecordBatch> batch;
-  ipc::ReadRecordBatch(*message, schema, &body_reader, &batch);
+  ipc::ReadRecordBatch(*message, schema, &batch);
 
   for (int i = 0; i < batch->num_columns(); ++i) {
     const auto& column = *batch->column(i);
@@ -498,7 +448,7 @@ void print_serialized_records(const uint8_t* data, const size_t length, const st
 #undef RETURN_IF_NOT_OK
 #undef ASSERT_OK
 
-key_t get_and_copy_to_shm(const std::shared_ptr<PoolBuffer>& data) {
+key_t get_and_copy_to_shm(const std::shared_ptr<Buffer>& data) {
   if (!data->size()) {
     return IPC_PRIVATE;
   }
@@ -694,9 +644,17 @@ arrow::RecordBatch ResultSet::convertToArrow(const std::vector<std::string>& col
 
 ResultSet::SerializedArrowOutput ResultSet::getSerializedArrowOutput(const std::vector<std::string>& col_names) const {
   arrow::ipc::DictionaryMemo dict_memo;
-  const auto arrow_copy = convertToArrow(col_names, dict_memo);
-  const auto serialized_schema = arrow::serialize_arrow_schema(arrow_copy.schema(), dict_memo);
-  const auto serialized_records = arrow::serialize_arrow_records(arrow_copy);
+  arrow::RecordBatch arrow_copy = convertToArrow(col_names, dict_memo);
+
+  std::shared_ptr<arrow::Buffer> serialized_records, serialized_schema;
+
+  arrow::ipc::SerializeSchema(*arrow_copy.schema(),
+                              arrow::default_memory_pool(),
+                              &serialized_schema);
+
+  arrow::ipc::SerializeRecordBatch(arrow_copy,
+                                   arrow::default_memory_pool(),
+                                   &serialized_records);
   return {serialized_schema, serialized_records};
 }
 

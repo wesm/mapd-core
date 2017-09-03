@@ -18,9 +18,9 @@
 #include "ArrowResultSet.h"
 #include "RelAlgExecutionDescriptor.h"
 
-#include <arrow/array.h>
+#include <arrow/api.h>
 #include <arrow/io/memory.h>
-#include <arrow/ipc/reader.h>
+#include <arrow/ipc/api.h>
 
 namespace {
 
@@ -49,8 +49,8 @@ SQLTypeInfo type_from_arrow_field(const arrow::Field& field) {
 
 ArrowResultSet::ArrowResultSet(const std::shared_ptr<arrow::Schema>& schema,
                                const std::shared_ptr<arrow::RecordBatch>& record_batch,
-                               const std::vector<std::shared_ptr<arrow::PoolBuffer>>& pool_buffers)
-    : record_batch_(record_batch), pool_buffers_(pool_buffers), crt_row_idx_(0) {
+                               const std::vector<std::shared_ptr<arrow::Buffer>>& buffers)
+    : record_batch_(record_batch), buffers_(buffers), crt_row_idx_(0) {
   CHECK_EQ(schema->num_fields(), record_batch->num_columns());
   for (int i = 0; i < schema->num_fields(); ++i) {
     column_metainfo_.emplace_back(schema->field(i)->name(), type_from_arrow_field(*schema->field(i)));
@@ -157,22 +157,17 @@ std::unique_ptr<ArrowResultSet> result_set_arrow_loopback(const ExecutionResult&
       std::make_shared<arrow::Buffer>(serialized_arrow_output.records->data(), serialized_arrow_output.records->size());
   auto records_buffer_reader = std::make_shared<arrow::io::BufferReader>(records_payload);
 
-  std::shared_ptr<arrow::ipc::Message> message;
+  std::unique_ptr<arrow::ipc::Message> message;
   arrow::ipc::ReadMessage(records_buffer_reader.get(), &message);
 
-  // The buffer offsets start at 0, so we must construct a
-  // RandomAccessFile according to that frame of reference
-  std::shared_ptr<arrow::Buffer> body_payload;
-  records_buffer_reader->Read(message->body_length(), &body_payload);
-  arrow::io::BufferReader body_reader(body_payload);
-
   std::shared_ptr<arrow::RecordBatch> batch;
-  arrow::ipc::ReadRecordBatch(*message, schema, &body_reader, &batch);
+  arrow::ipc::ReadRecordBatch(*message, schema, &batch);
 
   return boost::make_unique<ArrowResultSet>(
       schema,
       batch,
-      std::vector<std::shared_ptr<arrow::PoolBuffer>>{serialized_arrow_output.schema, serialized_arrow_output.records});
+      std::vector<std::shared_ptr<arrow::Buffer>>{serialized_arrow_output.schema,
+          serialized_arrow_output.records});
 }
 
 #endif  // ENABLE_ARROW_CONVERTER

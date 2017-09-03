@@ -31,9 +31,8 @@
 #include "../Chunk/Chunk.h"
 
 #ifdef ENABLE_ARROW_CONVERTER
-#include "arrow/ipc/metadata.h"
-#include "arrow/table.h"
-#include "arrow/buffer.h"
+#include "arrow/api.h"
+#include "arrow/ipc/api.h"
 // Arrow defines macro UNUSED conflict w/ that in jni_md.h
 #ifdef UNUSED
 #undef UNUSED
@@ -350,8 +349,8 @@ class ResultSet {
 
 #ifdef ENABLE_ARROW_CONVERTER
   struct SerializedArrowOutput {
-    std::shared_ptr<arrow::PoolBuffer> schema;
-    std::shared_ptr<arrow::PoolBuffer> records;
+    std::shared_ptr<arrow::Buffer> schema;
+    std::shared_ptr<arrow::Buffer> records;
   };
 
   SerializedArrowOutput getSerializedArrowOutput(const std::vector<std::string>& col_names) const;
