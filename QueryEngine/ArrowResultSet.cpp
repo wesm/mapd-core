@@ -155,10 +155,8 @@ std::unique_ptr<ArrowResultSet> result_set_arrow_loopback(const ExecutionResult&
   ARROW_THROW_NOT_OK(arrow::ipc::ReadSchema(&schema_reader, &schema));
 
   std::shared_ptr<arrow::RecordBatch> batch;
-  std::unique_ptr<arrow::ipc::Message> message;
   arrow::io::BufferReader records_reader(serialized_arrow_output.records);
-  ARROW_THROW_NOT_OK(arrow::ipc::ReadMessage(&records_reader, &message));
-  ARROW_THROW_NOT_OK(arrow::ipc::ReadRecordBatch(*message, schema, &batch));
+  ARROW_THROW_NOT_OK(arrow::ipc::ReadRecordBatch(schema, &records_reader, &batch));
 
   return boost::make_unique<ArrowResultSet>(
       schema,

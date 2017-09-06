@@ -307,13 +307,10 @@ void print_serialized_records(const uint8_t* data, const size_t length, const st
     std::cout << "No row found" << std::endl;
     return;
   }
-  std::unique_ptr<ipc::Message> message;
   std::shared_ptr<RecordBatch> batch;
 
   io::BufferReader buffer_reader(std::make_shared<arrow::Buffer>(data, length));
-
-  ARROW_THROW_NOT_OK(ReadMessage(&buffer_reader, &message));
-  ARROW_THROW_NOT_OK(ipc::ReadRecordBatch(*message, schema, &batch));
+  ARROW_THROW_NOT_OK(ipc::ReadRecordBatch(schema, &buffer_reader, &batch));
   ARROW_THROW_NOT_OK(PrettyPrint(*batch, 0, &std::cout));
 }
 
