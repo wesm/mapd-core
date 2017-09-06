@@ -471,8 +471,7 @@ class ResultSet {
 #ifdef ENABLE_ARROW_CONVERTER
   arrow::RecordBatch convertToArrow(const std::vector<std::string>& col_names, arrow::ipc::DictionaryMemo& memo) const;
   std::shared_ptr<const std::vector<std::string>> getDictionary(const int dict_id) const;
-  std::pair<std::vector<std::shared_ptr<arrow::Array>>, size_t> getArrowColumns(
-      const std::vector<std::shared_ptr<arrow::Field>>& fields) const;
+  arrow::RecordBatch getArrowBatch(const std::shared_ptr<arrow::Schema>& schema) const;
 
   ArrowResult getArrowCopyOnCpu(const std::vector<std::string>& col_names) const;
   ArrowResult getArrowCopyOnGpu(Data_Namespace::DataMgr* data_mgr,

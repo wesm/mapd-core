@@ -16,6 +16,7 @@
 
 #ifdef ENABLE_ARROW_CONVERTER
 #include "ArrowResultSet.h"
+#include "ArrowUtil.h"
 #include "RelAlgExecutionDescriptor.h"
 
 #include <arrow/api.h>
@@ -68,36 +69,36 @@ std::vector<TargetValue> ArrowResultSet::getNextRow(const bool translate_strings
     const auto& column_typeinfo = getColType(i);
     switch (column_typeinfo.get_type()) {
       case kSMALLINT: {
-        CHECK(dynamic_cast<const arrow::NumericArray<arrow::Int16Type>*>(&column));
-        const auto& i16_column = static_cast<const arrow::NumericArray<arrow::Int16Type>&>(column);
+        CHECK(dynamic_cast<const arrow::Int16Array*>(&column));
+        const auto& i16_column = static_cast<const arrow::Int16Array&>(column);
         row.emplace_back(i16_column.IsNull(crt_row_idx_) ? inline_int_null_val(column_typeinfo)
                                                          : static_cast<int64_t>(i16_column.Value(crt_row_idx_)));
         break;
       }
       case kINT: {
-        CHECK(dynamic_cast<const arrow::NumericArray<arrow::Int32Type>*>(&column));
-        const auto& i32_column = static_cast<const arrow::NumericArray<arrow::Int32Type>&>(column);
+        CHECK(dynamic_cast<const arrow::Int32Array*>(&column));
+        const auto& i32_column = static_cast<const arrow::Int32Array&>(column);
         row.emplace_back(i32_column.IsNull(crt_row_idx_) ? inline_int_null_val(column_typeinfo)
                                                          : static_cast<int64_t>(i32_column.Value(crt_row_idx_)));
         break;
       }
       case kBIGINT: {
-        CHECK(dynamic_cast<const arrow::NumericArray<arrow::Int64Type>*>(&column));
-        const auto& i64_column = static_cast<const arrow::NumericArray<arrow::Int64Type>&>(column);
+        CHECK(dynamic_cast<const arrow::Int64Array*>(&column));
+        const auto& i64_column = static_cast<const arrow::Int64Array&>(column);
         row.emplace_back(i64_column.IsNull(crt_row_idx_) ? inline_int_null_val(column_typeinfo)
                                                          : static_cast<int64_t>(i64_column.Value(crt_row_idx_)));
         break;
       }
       case kFLOAT: {
-        CHECK(dynamic_cast<const arrow::NumericArray<arrow::FloatType>*>(&column));
-        const auto& float_column = static_cast<const arrow::NumericArray<arrow::FloatType>&>(column);
+        CHECK(dynamic_cast<const arrow::FloatArray*>(&column));
+        const auto& float_column = static_cast<const arrow::FloatArray&>(column);
         row.emplace_back(float_column.IsNull(crt_row_idx_) ? inline_fp_null_value<float>()
                                                            : float_column.Value(crt_row_idx_));
         break;
       }
       case kDOUBLE: {
-        CHECK(dynamic_cast<const arrow::NumericArray<arrow::DoubleType>*>(&column));
-        const auto& double_column = static_cast<const arrow::NumericArray<arrow::DoubleType>&>(column);
+        CHECK(dynamic_cast<const arrow::DoubleArray*>(&column));
+        const auto& double_column = static_cast<const arrow::DoubleArray&>(column);
         row.emplace_back(double_column.IsNull(crt_row_idx_) ? inline_fp_null_value<double>()
                                                             : double_column.Value(crt_row_idx_));
         break;
@@ -109,7 +110,7 @@ std::vector<TargetValue> ArrowResultSet::getNextRow(const bool translate_strings
         if (dict_column.IsNull(crt_row_idx_)) {
           row.emplace_back(NullableString(nullptr));
         } else {
-          const auto& indices = static_cast<const arrow::NumericArray<arrow::Int32Type>&>(*dict_column.indices());
+          const auto& indices = static_cast<const arrow::Int32Array&>(*dict_column.indices());
           const auto& dictionary = static_cast<const arrow::StringArray&>(*dict_column.dictionary());
           row.emplace_back(dictionary.GetString(indices.Value(crt_row_idx_)));
         }
@@ -147,21 +148,17 @@ std::unique_ptr<ArrowResultSet> result_set_arrow_loopback(const ExecutionResult&
     col_names.push_back(target_meta.get_resname());
   }
   const auto serialized_arrow_output = results.getRows()->getSerializedArrowOutput(col_names);
-  const auto schema_payload =
-      std::make_shared<arrow::Buffer>(serialized_arrow_output.schema->data(), serialized_arrow_output.schema->size());
-  auto schema_buffer = std::make_shared<arrow::io::BufferReader>(schema_payload);
-  std::shared_ptr<arrow::ipc::RecordBatchStreamReader> schema_reader;
-  arrow::ipc::RecordBatchStreamReader::Open(schema_buffer, &schema_reader);
-  auto schema = schema_reader->schema();
-  const auto records_payload =
-      std::make_shared<arrow::Buffer>(serialized_arrow_output.records->data(), serialized_arrow_output.records->size());
-  auto records_buffer_reader = std::make_shared<arrow::io::BufferReader>(records_payload);
 
-  std::unique_ptr<arrow::ipc::Message> message;
-  arrow::ipc::ReadMessage(records_buffer_reader.get(), &message);
+  arrow::io::BufferReader schema_reader(serialized_arrow_output.schema);
+
+  std::shared_ptr<arrow::Schema> schema;
+  ARROW_THROW_NOT_OK(arrow::ipc::ReadSchema(&schema_reader, &schema));
 
   std::shared_ptr<arrow::RecordBatch> batch;
-  arrow::ipc::ReadRecordBatch(*message, schema, &batch);
+  std::unique_ptr<arrow::ipc::Message> message;
+  arrow::io::BufferReader records_reader(serialized_arrow_output.records);
+  ARROW_THROW_NOT_OK(arrow::ipc::ReadMessage(&records_reader, &message));
+  ARROW_THROW_NOT_OK(arrow::ipc::ReadRecordBatch(*message, schema, &batch));
 
   return boost::make_unique<ArrowResultSet>(
       schema,

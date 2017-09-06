@@ -30,6 +30,8 @@
 #include "arrow/io/memory.h"
 #include "arrow/ipc/api.h"
 
+#include "ArrowUtil.h"
+
 #ifdef HAVE_CUDA
 #include <cuda.h>
 
@@ -150,41 +152,25 @@ void create_or_append_validity(const ScalarTargetValue& value,
 
 namespace arrow {
 
-#define ASSERT_OK(expr)           \
-  do {                            \
-    Status s = (expr);            \
-    if (!s.ok()) {                \
-      LOG(ERROR) << s.ToString(); \
-    }                             \
-  } while (0)
-
-#define RETURN_IF_NOT_OK(s) \
-  do {                      \
-    arrow::Status _s = (s); \
-    if (!_s.ok()) {         \
-      return nullptr;       \
-    }                       \
-  } while (0);
-
-TypePtr get_arrow_type(const SQLTypeInfo& mapd_type, const std::shared_ptr<Array>& dictionary) {
+static TypePtr get_arrow_type(const SQLTypeInfo& mapd_type, const std::shared_ptr<Array>& dict_values) {
   switch (get_physical_type(mapd_type)) {
     case kBOOLEAN:
-      return std::make_shared<BooleanType>();
+      return boolean();
     case kSMALLINT:
-      return std::make_shared<Int16Type>();
+      return int16();
     case kINT:
-      return std::make_shared<Int32Type>();
+      return int32();
     case kBIGINT:
-      return std::make_shared<Int64Type>();
+      return int64();
     case kFLOAT:
-      return std::make_shared<FloatType>();
+      return float32();
     case kDOUBLE:
-      return std::make_shared<DoubleType>();
+      return float64();
     case kTEXT:
       if (is_dict_enc_str(mapd_type)) {
-        CHECK(dictionary);
+        CHECK(dict_values);
         const auto index_type = get_arrow_type(get_dict_index_type_info(mapd_type), nullptr);
-        return std::make_shared<DictionaryType>(index_type, dictionary);
+        return dictionary(index_type, dict_values);
       }
     case kDECIMAL:
     case kNUMERIC:
@@ -202,215 +188,108 @@ TypePtr get_arrow_type(const SQLTypeInfo& mapd_type, const std::shared_ptr<Array
   return nullptr;
 }
 
+struct ColumnBuilder {
+  std::shared_ptr<Field> field;
+  std::unique_ptr<arrow::ArrayBuilder> builder;
+  arrow::ArrayBuilder* raw_builder;
+  SQLTypeInfo col_type;
+  SQLTypes physical_type;
+
+  void init(const SQLTypeInfo& col_type, const std::shared_ptr<Field>& field) {
+    this->field = field;
+
+    this->col_type = col_type;
+    this->physical_type = is_dict_enc_str(col_type) ? get_dict_index_type(col_type) : get_physical_type(col_type);
+
+    auto value_type = field->type();
+    if (value_type->id() == Type::DICTIONARY) {
+      value_type = static_cast<const DictionaryType&>(*value_type).index_type();
+    }
+    ARROW_THROW_NOT_OK(arrow::MakeBuilder(default_memory_pool(), value_type, &this->builder));
+    this->raw_builder = this->builder.get();
+  }
+
+  void reserve(size_t row_count) { ARROW_THROW_NOT_OK(builder->Reserve(static_cast<int64_t>(row_count))); }
+
+  template <typename BuilderType, typename C_TYPE>
+  inline void append_to_builder(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid) {
+    const std::vector<C_TYPE>& vals = boost::get<std::vector<C_TYPE>>(values);
+
+    auto typed_builder = static_cast<BuilderType*>(this->raw_builder);
+
+    int64_t length = static_cast<int64_t>(vals.size());
+
+    if (this->field->nullable()) {
+      CHECK(is_valid.get());
+      ARROW_THROW_NOT_OK(typed_builder->Append(vals.data(), length, *is_valid));
+    } else {
+      ARROW_THROW_NOT_OK(typed_builder->Append(vals.data(), length));
+    }
+  }
+
+  std::shared_ptr<Array> finish() {
+    std::shared_ptr<Array> values;
+    ARROW_THROW_NOT_OK(this->builder->Finish(&values));
+    if (this->field->type()->id() == Type::DICTIONARY) {
+      return std::make_shared<DictionaryArray>(this->field->type(), values);
+    } else {
+      return values;
+    }
+  }
+
+  void append(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid);
+};
+
+template <>
+inline void ColumnBuilder::append_to_builder<BooleanBuilder, bool>(const ValueArray& values,
+                                                                   const std::shared_ptr<std::vector<bool>>& is_valid) {
+  const std::vector<bool>& vals = boost::get<std::vector<bool>>(values);
+
+  auto typed_builder = static_cast<BooleanBuilder*>(this->raw_builder);
+  if (this->field->nullable()) {
+    CHECK(is_valid.get());
+    ARROW_THROW_NOT_OK(typed_builder->Append(vals, *is_valid));
+  } else {
+    ARROW_THROW_NOT_OK(typed_builder->Append(vals, {}));
+  }
+}
+
+void ColumnBuilder::append(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid) {
+  switch (this->physical_type) {
+    case kBOOLEAN:
+      append_to_builder<BooleanBuilder, bool>(values, is_valid);
+      break;
+    case kSMALLINT:
+      append_to_builder<Int16Builder, int16_t>(values, is_valid);
+      break;
+    case kINT:
+      append_to_builder<Int32Builder, int32_t>(values, is_valid);
+      break;
+    case kBIGINT:
+      append_to_builder<Int64Builder, int64_t>(values, is_valid);
+      break;
+    case kFLOAT:
+      append_to_builder<FloatBuilder, float>(values, is_valid);
+      break;
+    case kDOUBLE:
+      append_to_builder<DoubleBuilder, double>(values, is_valid);
+      break;
+    default:
+      // TODO(miyu): support more scalar types.
+      CHECK(false);
+  }
+}
+
 std::shared_ptr<Field> make_field(const std::string name,
                                   const SQLTypeInfo& target_type,
                                   const std::shared_ptr<Array>& dictionary) {
-  return std::make_shared<Field>(name, get_arrow_type(target_type, dictionary), !target_type.get_notnull());
-}
-
-// Cited from arrow/test-util.h
-template <typename TYPE, typename C_TYPE>
-std::shared_ptr<Array> array_from_vector(const std::shared_ptr<std::vector<bool>> is_valid,
-                                         const std::vector<C_TYPE>& values) {
-  std::shared_ptr<Array> out;
-  MemoryPool* pool = default_memory_pool();
-  typename TypeTraits<TYPE>::BuilderType builder(pool);
-  if (is_valid) {
-    for (size_t i = 0; i < values.size(); ++i) {
-      if ((*is_valid)[i]) {
-        ASSERT_OK(builder.Append(values[i]));
-      } else {
-        ASSERT_OK(builder.AppendNull());
-      }
-    }
-  } else {
-    for (size_t i = 0; i < values.size(); ++i) {
-      ASSERT_OK(builder.Append(values[i]));
-    }
-  }
-  ASSERT_OK(builder.Finish(&out));
-  return out;
-}
-
-std::shared_ptr<Array> generate_column(const Field& field,
-                                       const std::shared_ptr<std::vector<bool>> is_valid,
-                                       const ValueArray& values) {
-  switch (field.type()->id()) {
-    case Type::BOOL: {
-      auto vals_bool = boost::get<std::vector<bool>>(&values);
-      CHECK(vals_bool);
-      return array_from_vector<BooleanType, bool>(is_valid, *vals_bool);
-    }
-    case Type::INT8: {
-      auto vals_i8 = boost::get<std::vector<int8_t>>(&values);
-      CHECK(vals_i8);
-      return array_from_vector<Int8Type, int8_t>(is_valid, *vals_i8);
-    }
-    case Type::INT16: {
-      auto vals_i16 = boost::get<std::vector<int16_t>>(&values);
-      CHECK(vals_i16);
-      return array_from_vector<Int16Type, int16_t>(is_valid, *vals_i16);
-    }
-    case Type::INT32: {
-      auto vals_i32 = boost::get<std::vector<int32_t>>(&values);
-      CHECK(vals_i32);
-      return array_from_vector<Int32Type, int32_t>(is_valid, *vals_i32);
-    }
-    case Type::INT64: {
-      auto vals_i64 = boost::get<std::vector<int64_t>>(&values);
-      CHECK(vals_i64);
-      return array_from_vector<Int64Type, int64_t>(is_valid, *vals_i64);
-    }
-    case Type::FLOAT: {
-      auto vals_float = boost::get<std::vector<float>>(&values);
-      CHECK(vals_float);
-      return array_from_vector<FloatType, float>(is_valid, *vals_float);
-    }
-    case Type::DOUBLE: {
-      auto vals_double = boost::get<std::vector<double>>(&values);
-      CHECK(vals_double);
-      return array_from_vector<DoubleType, double>(is_valid, *vals_double);
-    }
-    case Type::DICTIONARY: {
-      const auto dict_type = std::static_pointer_cast<DictionaryType>(field.type());
-      Field index_child(field.name(), dict_type->index_type(), field.nullable());
-      auto indices = generate_column(index_child, is_valid, values);
-      return std::make_shared<DictionaryArray>(dict_type, indices);
-    }
-    default:
-      CHECK(false);
-  }
-  return nullptr;
-}
-
-std::vector<std::shared_ptr<Array>> generate_columns(
-    const std::vector<std::shared_ptr<Field>>& fields,
-    const std::vector<std::shared_ptr<std::vector<bool>>>& null_bitmaps,
-    const std::vector<std::shared_ptr<ValueArray>>& column_values) {
-  const auto col_count = fields.size();
-  CHECK_GT(col_count, 0);
-  std::vector<std::shared_ptr<arrow::Array>> columns(col_count, nullptr);
-  auto generate = [&](const size_t i, std::shared_ptr<arrow::Array>& column) {
-    CHECK(column_values[i]);
-    column = generate_column(*fields[i], null_bitmaps[i], *column_values[i]);
-  };
-  if (col_count > 1) {
-    std::vector<std::future<void>> child_threads;
-    for (size_t col_idx = 0; col_idx < col_count; ++col_idx) {
-      child_threads.push_back(std::async(std::launch::async, generate, col_idx, std::ref(columns[col_idx])));
-    }
-    for (auto& child : child_threads) {
-      child.get();
-    }
-  } else {
-    generate(0, columns[0]);
-  }
-  return columns;
-}
-
-std::shared_ptr<ValueArray> create_value_array(const Field& field, const size_t value_count) {
-  const auto type_id = field.type()->id() == Type::DICTIONARY
-                           ? std::static_pointer_cast<DictionaryType>(field.type())->index_type()->id()
-                           : field.type()->id();
-  switch (type_id) {
-    case Type::BOOL: {
-      auto array = std::make_shared<ValueArray>(std::vector<bool>());
-      boost::get<std::vector<bool>>(*array).reserve(value_count);
-      return array;
-    }
-    case Type::INT8: {
-      auto array = std::make_shared<ValueArray>(std::vector<int8_t>());
-      boost::get<std::vector<int8_t>>(*array).reserve(value_count);
-      return array;
-    }
-    case Type::INT16: {
-      auto array = std::make_shared<ValueArray>(std::vector<int16_t>());
-      boost::get<std::vector<int16_t>>(*array).reserve(value_count);
-      return array;
-    }
-    case Type::INT32: {
-      auto array = std::make_shared<ValueArray>(std::vector<int32_t>());
-      boost::get<std::vector<int32_t>>(*array).reserve(value_count);
-      return array;
-    }
-    case Type::INT64: {
-      auto array = std::make_shared<ValueArray>(std::vector<int64_t>());
-      boost::get<std::vector<int64_t>>(*array).reserve(value_count);
-      return array;
-    }
-    case Type::FLOAT: {
-      auto array = std::make_shared<ValueArray>(std::vector<float>());
-      boost::get<std::vector<float>>(*array).reserve(value_count);
-      return array;
-    }
-    case Type::DOUBLE: {
-      auto array = std::make_shared<ValueArray>(std::vector<double>());
-      boost::get<std::vector<double>>(*array).reserve(value_count);
-      return array;
-    }
-    default:
-      CHECK(false);
-  }
-  return nullptr;
-}
-
-void append_value_array(ValueArray& dst, const ValueArray& src, const Field& field) {
-  const auto type_id = field.type()->id() == Type::DICTIONARY
-                           ? std::static_pointer_cast<DictionaryType>(field.type())->index_type()->id()
-                           : field.type()->id();
-  switch (type_id) {
-    case Type::BOOL: {
-      auto dst_bool = boost::get<std::vector<bool>>(&dst);
-      auto src_bool = boost::get<std::vector<bool>>(&src);
-      CHECK(dst_bool && src_bool);
-      dst_bool->insert(dst_bool->end(), src_bool->begin(), src_bool->end());
-    } break;
-    case Type::INT8: {
-      auto dst_i8 = boost::get<std::vector<int8_t>>(&dst);
-      auto src_i8 = boost::get<std::vector<int8_t>>(&src);
-      CHECK(dst_i8 && src_i8);
-      dst_i8->insert(dst_i8->end(), src_i8->begin(), src_i8->end());
-    } break;
-    case Type::INT16: {
-      auto dst_i16 = boost::get<std::vector<int16_t>>(&dst);
-      auto src_i16 = boost::get<std::vector<int16_t>>(&src);
-      CHECK(dst_i16 && src_i16);
-      dst_i16->insert(dst_i16->end(), src_i16->begin(), src_i16->end());
-    } break;
-    case Type::INT32: {
-      auto dst_i32 = boost::get<std::vector<int32_t>>(&dst);
-      auto src_i32 = boost::get<std::vector<int32_t>>(&src);
-      CHECK(dst_i32 && src_i32);
-      dst_i32->insert(dst_i32->end(), src_i32->begin(), src_i32->end());
-    } break;
-    case Type::INT64: {
-      auto dst_i64 = boost::get<std::vector<int64_t>>(&dst);
-      auto src_i64 = boost::get<std::vector<int64_t>>(&src);
-      CHECK(dst_i64 && src_i64);
-      dst_i64->insert(dst_i64->end(), src_i64->begin(), src_i64->end());
-    } break;
-    case Type::FLOAT: {
-      auto dst_flt = boost::get<std::vector<float>>(&dst);
-      auto src_flt = boost::get<std::vector<float>>(&src);
-      CHECK(dst_flt && src_flt);
-      dst_flt->insert(dst_flt->end(), src_flt->begin(), src_flt->end());
-    } break;
-    case Type::DOUBLE: {
-      auto dst_dbl = boost::get<std::vector<double>>(&dst);
-      auto src_dbl = boost::get<std::vector<double>>(&src);
-      CHECK(dst_dbl && src_dbl);
-      dst_dbl->insert(dst_dbl->end(), src_dbl->begin(), src_dbl->end());
-    } break;
-    default:
-      CHECK(false);
-      break;
-  }
+  return field(name, get_arrow_type(target_type, dictionary), !target_type.get_notnull());
 }
 
 void print_serialized_schema(const uint8_t* data, const size_t length) {
   io::BufferReader reader(std::make_shared<arrow::Buffer>(data, length));
   std::shared_ptr<Schema> schema;
-  ipc::ReadSchema(&reader, &schema);
+  ARROW_THROW_NOT_OK(ipc::ReadSchema(&reader, &schema));
 
   std::cout << "Schema: " << schema->ToString() << std::endl;
   for (int i = 0; i < schema->num_fields(); ++i) {
@@ -418,7 +297,7 @@ void print_serialized_schema(const uint8_t* data, const size_t length) {
     if (!dict_type) {
       continue;
     }
-    PrettyPrint(*dict_type->dictionary(), 0, &std::cout);
+    ARROW_THROW_NOT_OK(PrettyPrint(*dict_type->dictionary(), 0, &std::cout));
     std::cout << std::endl;
   }
 }
@@ -428,25 +307,15 @@ void print_serialized_records(const uint8_t* data, const size_t length, const st
     std::cout << "No row found" << std::endl;
     return;
   }
+  std::unique_ptr<ipc::Message> message;
+  std::shared_ptr<RecordBatch> batch;
 
   io::BufferReader buffer_reader(std::make_shared<arrow::Buffer>(data, length));
 
-  std::unique_ptr<ipc::Message> message;
-  ReadMessage(&buffer_reader, &message);
-
-  std::shared_ptr<RecordBatch> batch;
-  ipc::ReadRecordBatch(*message, schema, &batch);
-
-  for (int i = 0; i < batch->num_columns(); ++i) {
-    const auto& column = *batch->column(i);
-    std::cout << "Column #" << i << ": ";
-    PrettyPrint(column, 0, &std::cout);
-    std::cout << std::endl;
-  }
+  ARROW_THROW_NOT_OK(ReadMessage(&buffer_reader, &message));
+  ARROW_THROW_NOT_OK(ipc::ReadRecordBatch(*message, schema, &batch));
+  ARROW_THROW_NOT_OK(PrettyPrint(*batch, 0, &std::cout));
 }
-
-#undef RETURN_IF_NOT_OK
-#undef ASSERT_OK
 
 key_t get_and_copy_to_shm(const std::shared_ptr<Buffer>& data) {
   if (!data->size()) {
@@ -498,14 +367,22 @@ std::shared_ptr<const std::vector<std::string>> ResultSet::getDictionary(const i
   return sdp->getDictionary()->copyStrings();
 }
 
-std::pair<std::vector<std::shared_ptr<arrow::Array>>, size_t> ResultSet::getArrowColumns(
-    const std::vector<std::shared_ptr<arrow::Field>>& fields) const {
+arrow::RecordBatch ResultSet::getArrowBatch(const std::shared_ptr<arrow::Schema>& schema) const {
+  std::vector<std::shared_ptr<arrow::Array>> result_columns;
+
   const auto entry_count = entryCount();
   if (!entry_count) {
-    return {{}, 0};
+    return arrow::RecordBatch(schema, 0, result_columns);
   }
   const auto col_count = colCount();
   size_t row_count = 0;
+
+  std::vector<arrow::ColumnBuilder> builders(col_count);
+
+  // Create array builders
+  for (size_t i = 0; i < col_count; ++i) {
+    builders[i].init(getColType(i), schema->field(i));
+  }
 
   // TODO(miyu): speed up for columnar buffers
   auto fetch = [&](std::vector<std::shared_ptr<ValueArray>>& value_seg,
@@ -586,31 +463,27 @@ std::pair<std::vector<std::shared_ptr<arrow::Array>>, size_t> ResultSet::getArro
     for (auto& child : child_threads) {
       row_count += child.get();
     }
-    for (size_t i = 0; i < fields.size(); ++i) {
-      column_values[i] = arrow::create_value_array(*fields[i], row_count);
-      if (fields[i]->nullable()) {
-        null_bitmaps[i] = std::make_shared<std::vector<bool>>();
-        null_bitmaps[i]->reserve(row_count);
-      }
+    for (int i = 0; i < schema->num_fields(); ++i) {
+      builders[i].reserve(row_count);
       for (size_t j = 0; j < cpu_count; ++j) {
         if (!column_value_segs[j][i]) {
           continue;
         }
-        arrow::append_value_array(*column_values[i], *column_value_segs[j][i], *fields[i]);
-        if (fields[i]->nullable()) {
-          CHECK(null_bitmap_segs[j][i]);
-          null_bitmaps[i]->insert(
-              null_bitmaps[i]->end(), null_bitmap_segs[j][i]->begin(), null_bitmap_segs[j][i]->end());
-        }
+        builders[i].append(*column_value_segs[j][i], null_bitmap_segs[j][i]);
       }
     }
   } else {
     row_count = fetch(column_values, null_bitmaps, size_t(0), entry_count);
+    for (int i = 0; i < schema->num_fields(); ++i) {
+      builders[i].reserve(row_count);
+      builders[i].append(*column_values[i], null_bitmaps[i]);
+    }
   }
 
-  return {row_count > 0 ? generate_columns(fields, null_bitmaps, column_values)
-                        : std::vector<std::shared_ptr<arrow::Array>>(),
-          row_count};
+  for (size_t i = 0; i < col_count; ++i) {
+    result_columns.push_back(builders[i].finish());
+  }
+  return arrow::RecordBatch(schema, row_count, result_columns);
 }
 
 arrow::RecordBatch ResultSet::convertToArrow(const std::vector<std::string>& col_names,
@@ -624,22 +497,22 @@ arrow::RecordBatch ResultSet::convertToArrow(const std::vector<std::string>& col
     if (is_dict_enc_str(ti)) {
       const int dict_id = ti.get_comp_param();
       if (memo.HasDictionaryId(dict_id)) {
-        memo.GetDictionary(dict_id, &dict);
+        ARROW_THROW_NOT_OK(memo.GetDictionary(dict_id, &dict));
       } else {
         auto str_list = getDictionary(dict_id);
-        dict = arrow::array_from_vector<arrow::StringType, std::string>(nullptr, *str_list);
-        memo.AddDictionary(dict_id, dict);
+
+        arrow::StringBuilder builder;
+        for (const std::string& val : *str_list) {
+          ARROW_THROW_NOT_OK(builder.Append(val));
+        }
+        ARROW_THROW_NOT_OK(builder.Finish(&dict));
+        ARROW_THROW_NOT_OK(memo.AddDictionary(dict_id, dict));
       }
     }
     fields.push_back(arrow::make_field(col_names.empty() ? "" : col_names[i], ti, dict));
   }
-  auto schema = std::make_shared<arrow::Schema>(fields);
-  std::vector<std::shared_ptr<arrow::Array>> columns;
-  size_t row_count = 0;
-  if (col_count > 0) {
-    std::tie(columns, row_count) = getArrowColumns(fields);
-  }
-  return arrow::RecordBatch(schema, row_count, columns);
+  auto schema = arrow::schema(fields);
+  return getArrowBatch(schema);
 }
 
 ResultSet::SerializedArrowOutput ResultSet::getSerializedArrowOutput(const std::vector<std::string>& col_names) const {
@@ -648,13 +521,10 @@ ResultSet::SerializedArrowOutput ResultSet::getSerializedArrowOutput(const std::
 
   std::shared_ptr<arrow::Buffer> serialized_records, serialized_schema;
 
-  arrow::ipc::SerializeSchema(*arrow_copy.schema(),
-                              arrow::default_memory_pool(),
-                              &serialized_schema);
+  ARROW_THROW_NOT_OK(
+      arrow::ipc::SerializeSchema(*arrow_copy.schema(), arrow::default_memory_pool(), &serialized_schema));
 
-  arrow::ipc::SerializeRecordBatch(arrow_copy,
-                                   arrow::default_memory_pool(),
-                                   &serialized_records);
+  ARROW_THROW_NOT_OK(arrow::ipc::SerializeRecordBatch(arrow_copy, arrow::default_memory_pool(), &serialized_records));
   return {serialized_schema, serialized_records};
 }
 
