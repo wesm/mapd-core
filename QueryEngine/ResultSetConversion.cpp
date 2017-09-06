@@ -191,7 +191,6 @@ static TypePtr get_arrow_type(const SQLTypeInfo& mapd_type, const std::shared_pt
 struct ColumnBuilder {
   std::shared_ptr<Field> field;
   std::unique_ptr<arrow::ArrayBuilder> builder;
-  arrow::ArrayBuilder* raw_builder;
   SQLTypeInfo col_type;
   SQLTypes physical_type;
 
@@ -206,7 +205,6 @@ struct ColumnBuilder {
       value_type = static_cast<const DictionaryType&>(*value_type).index_type();
     }
     ARROW_THROW_NOT_OK(arrow::MakeBuilder(default_memory_pool(), value_type, &this->builder));
-    this->raw_builder = this->builder.get();
   }
 
   void reserve(size_t row_count) { ARROW_THROW_NOT_OK(builder->Reserve(static_cast<int64_t>(row_count))); }
@@ -215,7 +213,7 @@ struct ColumnBuilder {
   inline void append_to_builder(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid) {
     const std::vector<C_TYPE>& vals = boost::get<std::vector<C_TYPE>>(values);
 
-    auto typed_builder = static_cast<BuilderType*>(this->raw_builder);
+    auto typed_builder = static_cast<BuilderType*>(this->builder.get());
     if (this->field->nullable()) {
       CHECK(is_valid.get());
       ARROW_THROW_NOT_OK(typed_builder->Append(vals, *is_valid));
@@ -371,36 +369,34 @@ arrow::RecordBatch ResultSet::getArrowBatch(const std::shared_ptr<arrow::Schema>
       }
       ++seg_row_count;
       for (size_t j = 0; j < col_count; ++j) {
-        const auto& col_type = getColType(j);
         auto scalar_value = boost::get<ScalarTargetValue>(&row[j]);
         // TODO(miyu): support more types other than scalar.
         CHECK(scalar_value);
-        const auto physical_type =
-            is_dict_enc_str(col_type) ? get_dict_index_type(col_type) : get_physical_type(col_type);
-        switch (physical_type) {
+        const auto& column = builders[i];
+        switch (column.physical_type) {
           case kBOOLEAN:
             create_or_append_value<bool, int64_t>(*scalar_value, value_seg[j], entry_count);
-            create_or_append_validity<int64_t>(*scalar_value, col_type, null_bitmap_seg[j], entry_count);
+            create_or_append_validity<int64_t>(*scalar_value, column.col_type, null_bitmap_seg[j], entry_count);
             break;
           case kSMALLINT:
             create_or_append_value<int16_t, int64_t>(*scalar_value, value_seg[j], entry_count);
-            create_or_append_validity<int64_t>(*scalar_value, col_type, null_bitmap_seg[j], entry_count);
+            create_or_append_validity<int64_t>(*scalar_value, column.col_type, null_bitmap_seg[j], entry_count);
             break;
           case kINT:
             create_or_append_value<int32_t, int64_t>(*scalar_value, value_seg[j], entry_count);
-            create_or_append_validity<int64_t>(*scalar_value, col_type, null_bitmap_seg[j], entry_count);
+            create_or_append_validity<int64_t>(*scalar_value, column.col_type, null_bitmap_seg[j], entry_count);
             break;
           case kBIGINT:
             create_or_append_value<int64_t, int64_t>(*scalar_value, value_seg[j], entry_count);
-            create_or_append_validity<int64_t>(*scalar_value, col_type, null_bitmap_seg[j], entry_count);
+            create_or_append_validity<int64_t>(*scalar_value, column.col_type, null_bitmap_seg[j], entry_count);
             break;
           case kFLOAT:
             create_or_append_value<float, float>(*scalar_value, value_seg[j], entry_count);
-            create_or_append_validity<float>(*scalar_value, col_type, null_bitmap_seg[j], entry_count);
+            create_or_append_validity<float>(*scalar_value, column.col_type, null_bitmap_seg[j], entry_count);
             break;
           case kDOUBLE:
             create_or_append_value<double, double>(*scalar_value, value_seg[j], entry_count);
-            create_or_append_validity<double>(*scalar_value, col_type, null_bitmap_seg[j], entry_count);
+            create_or_append_validity<double>(*scalar_value, column.col_type, null_bitmap_seg[j], entry_count);
             break;
           default:
             // TODO(miyu): support more scalar types.
@@ -464,7 +460,7 @@ arrow::RecordBatch ResultSet::convertToArrow(const std::vector<std::string>& col
   CHECK(col_names.empty() || col_names.size() == col_count);
   for (size_t i = 0; i < col_count; ++i) {
     const auto ti = getColType(i);
-    std::shared_ptr<arrow::Array> dict = nullptr;
+    std::shared_ptr<arrow::Array> dict;
     if (is_dict_enc_str(ti)) {
       const int dict_id = ti.get_comp_param();
       if (memo.HasDictionaryId(dict_id)) {

@@ -20,12 +20,14 @@
 #include "arrow/status.h"
 #include "arrow/util/macros.h"
 
+#include "Shared/likely.h"
+
 void arrow_status_throw(const ::arrow::Status& s);
 
 #define ARROW_THROW_NOT_OK(s)                   \
   do {                                          \
     ::arrow::Status _s = (s);                   \
-    if (ARROW_PREDICT_FALSE(!_s.ok())) {        \
+    if (UNLIKELY(!_s.ok())) {                   \
       arrow_status_throw(_s);                   \
     }                                           \
   } while (0)
