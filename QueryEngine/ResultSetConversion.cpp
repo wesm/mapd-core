@@ -216,14 +216,11 @@ struct ColumnBuilder {
     const std::vector<C_TYPE>& vals = boost::get<std::vector<C_TYPE>>(values);
 
     auto typed_builder = static_cast<BuilderType*>(this->raw_builder);
-
-    int64_t length = static_cast<int64_t>(vals.size());
-
     if (this->field->nullable()) {
       CHECK(is_valid.get());
-      ARROW_THROW_NOT_OK(typed_builder->Append(vals.data(), length, *is_valid));
+      ARROW_THROW_NOT_OK(typed_builder->Append(vals, *is_valid));
     } else {
-      ARROW_THROW_NOT_OK(typed_builder->Append(vals.data(), length));
+      ARROW_THROW_NOT_OK(typed_builder->Append(vals));
     }
   }
 
@@ -237,48 +234,32 @@ struct ColumnBuilder {
     }
   }
 
-  void append(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid);
+  void append(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid) {
+    switch (this->physical_type) {
+      case kBOOLEAN:
+        append_to_builder<BooleanBuilder, bool>(values, is_valid);
+        break;
+      case kSMALLINT:
+        append_to_builder<Int16Builder, int16_t>(values, is_valid);
+        break;
+      case kINT:
+        append_to_builder<Int32Builder, int32_t>(values, is_valid);
+        break;
+      case kBIGINT:
+        append_to_builder<Int64Builder, int64_t>(values, is_valid);
+        break;
+      case kFLOAT:
+        append_to_builder<FloatBuilder, float>(values, is_valid);
+        break;
+      case kDOUBLE:
+        append_to_builder<DoubleBuilder, double>(values, is_valid);
+        break;
+      default:
+        // TODO(miyu): support more scalar types.
+        CHECK(false);
+    }
+  }
 };
-
-template <>
-inline void ColumnBuilder::append_to_builder<BooleanBuilder, bool>(const ValueArray& values,
-                                                                   const std::shared_ptr<std::vector<bool>>& is_valid) {
-  const std::vector<bool>& vals = boost::get<std::vector<bool>>(values);
-
-  auto typed_builder = static_cast<BooleanBuilder*>(this->raw_builder);
-  if (this->field->nullable()) {
-    CHECK(is_valid.get());
-    ARROW_THROW_NOT_OK(typed_builder->Append(vals, *is_valid));
-  } else {
-    ARROW_THROW_NOT_OK(typed_builder->Append(vals, {}));
-  }
-}
-
-void ColumnBuilder::append(const ValueArray& values, const std::shared_ptr<std::vector<bool>>& is_valid) {
-  switch (this->physical_type) {
-    case kBOOLEAN:
-      append_to_builder<BooleanBuilder, bool>(values, is_valid);
-      break;
-    case kSMALLINT:
-      append_to_builder<Int16Builder, int16_t>(values, is_valid);
-      break;
-    case kINT:
-      append_to_builder<Int32Builder, int32_t>(values, is_valid);
-      break;
-    case kBIGINT:
-      append_to_builder<Int64Builder, int64_t>(values, is_valid);
-      break;
-    case kFLOAT:
-      append_to_builder<FloatBuilder, float>(values, is_valid);
-      break;
-    case kDOUBLE:
-      append_to_builder<DoubleBuilder, double>(values, is_valid);
-      break;
-    default:
-      // TODO(miyu): support more scalar types.
-      CHECK(false);
-  }
-}
 
 std::shared_ptr<Field> make_field(const std::string name,
                                   const SQLTypeInfo& target_type,
@@ -291,15 +272,8 @@ void print_serialized_schema(const uint8_t* data, const size_t length) {
   std::shared_ptr<Schema> schema;
   ARROW_THROW_NOT_OK(ipc::ReadSchema(&reader, &schema));
 
-  std::cout << "Schema: " << schema->ToString() << std::endl;
-  for (int i = 0; i < schema->num_fields(); ++i) {
-    std::shared_ptr<DictionaryType> dict_type = std::dynamic_pointer_cast<DictionaryType>(schema->field(i)->type());
-    if (!dict_type) {
-      continue;
-    }
-    ARROW_THROW_NOT_OK(PrettyPrint(*dict_type->dictionary(), 0, &std::cout));
-    std::cout << std::endl;
-  }
+  std::cout << "Arrow Schema: " << std::endl;
+  ARROW_THROW_NOT_OK(PrettyPrint(*schema, {}, &std::cout));
 }
 
 void print_serialized_records(const uint8_t* data, const size_t length, const std::shared_ptr<Schema>& schema) {
