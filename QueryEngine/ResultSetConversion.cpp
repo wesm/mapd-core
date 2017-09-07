@@ -479,6 +479,9 @@ arrow::RecordBatch ResultSet::convertToArrow(const std::vector<std::string>& col
     fields.push_back(arrow::make_field(col_names.empty() ? "" : col_names[i], ti, dict));
   }
   auto schema = arrow::schema(fields);
+
+  ARROW_THROW_NOT_OK(PrettyPrint(*schema, {}, &std::cout));
+
   return getArrowBatch(schema);
 }
 
